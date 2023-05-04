@@ -8,7 +8,7 @@ import fetch from 'node-fetch'
 import { sendResponse } from '../utils'
 import { isNotEmptyString } from '../utils/is'
 import type { ApiModel, ChatContext, ChatGPTUnofficialProxyAPIOptions, ModelConfig } from '../types'
-import type { BalanceResponse, RequestOptions } from './types'
+import type { RequestOptions, SetProxyOptions, UsageResponse } from './types'
 
 const { HttpsProxyAgent } = httpsProxyAgent
 
@@ -23,10 +23,11 @@ const ErrorCodeMessage: Record<string, string> = {
 	500: '[OpenAI] 服务器繁忙，请稍后再试 | Internal Server Error',
 }
 
-const timeoutMs: number = !isNaN(+process.env.TIMEOUT_MS) ? +process.env.TIMEOUT_MS : 30 * 1000
+const timeoutMs: number = !isNaN(+process.env.TIMEOUT_MS) ? +process.env.TIMEOUT_MS : 100 * 1000
 const disableDebug: boolean = process.env.OPENAI_API_DISABLE_DEBUG === 'true'
 
 let apiModel: ApiModel
+const model = isNotEmptyString(process.env.OPENAI_API_MODEL) ? process.env.OPENAI_API_MODEL : 'gpt-3.5-turbo'
 
 if (!isNotEmptyString(process.env.OPENAI_API_KEY) && !isNotEmptyString(process.env.OPENAI_ACCESS_TOKEN))
 	throw new Error('Missing OPENAI_API_KEY or OPENAI_ACCESS_TOKEN environment variable')
@@ -36,10 +37,8 @@ let api: ChatGPTAPI | ChatGPTUnofficialProxyAPI
 (async () => {
 	// More Info: https://github.com/transitive-bullshit/chatgpt-api
 
-	if (isNotEmptyString(process.env.OPENAI_API_KEY)) {
-		const OPENAI_API_BASE_URL = process.env.OPENAI_API_BASE_URL
-		const OPENAI_API_MODEL = process.env.OPENAI_API_MODEL
-		const model = isNotEmptyString(OPENAI_API_MODEL) ? OPENAI_API_MODEL : 'gpt-3.5-turbo'
+  if (isNotEmptyString(process.env.OPENAI_API_KEY)) {
+    const OPENAI_API_BASE_URL = process.env.OPENAI_API_BASE_URL
 
 		const options: ChatGPTAPIOptions = {
 			apiKey: process.env.OPENAI_API_KEY,
@@ -65,24 +64,18 @@ let api: ChatGPTAPI | ChatGPTUnofficialProxyAPI
 
 		setupProxy(options)
 
-		api = new ChatGPTAPI({ ...options })
-		apiModel = 'ChatGPTAPI'
-	}
-	else {
-		const OPENAI_API_MODEL = process.env.OPENAI_API_MODEL
-		const options: ChatGPTUnofficialProxyAPIOptions = {
-			accessToken: process.env.OPENAI_ACCESS_TOKEN,
-			debug: !disableDebug,
-		}
+    api = new ChatGPTAPI({ ...options })
+    apiModel = 'ChatGPTAPI'
+  }
+  else {
+    const options: ChatGPTUnofficialProxyAPIOptions = {
+      accessToken: process.env.OPENAI_ACCESS_TOKEN,
+      apiReverseProxyUrl: isNotEmptyString(process.env.API_REVERSE_PROXY) ? process.env.API_REVERSE_PROXY : 'https://ai.fakeopen.com/api/conversation',
+      model,
+      debug: !disableDebug,
+    }
 
-		if (isNotEmptyString(OPENAI_API_MODEL))
-			options.model = OPENAI_API_MODEL
-
-		options.apiReverseProxyUrl = isNotEmptyString(process.env.API_REVERSE_PROXY)
-			? process.env.API_REVERSE_PROXY
-			: 'https://bypass.churchless.tech/api/conversation'
-
-		setupProxy(options)
+    setupProxy(options)
 
 		api = new ChatGPTUnofficialProxyAPI({ ...options })
 		apiModel = 'ChatGPTUnofficialProxyAPI'
@@ -90,14 +83,15 @@ let api: ChatGPTAPI | ChatGPTUnofficialProxyAPI
 })()
 
 async function chatReplyProcess(options: RequestOptions) {
-	const { message, lastContext, process, systemMessage } = options
-	try {
-		let options: SendMessageOptions = { timeoutMs }
+  const { message, lastContext, process, systemMessage, temperature, top_p } = options
+  try {
+    let options: SendMessageOptions = { timeoutMs }
 
-		if (apiModel === 'ChatGPTAPI') {
-			if (isNotEmptyString(systemMessage))
-				options.systemMessage = systemMessage
-		}
+    if (apiModel === 'ChatGPTAPI') {
+      if (isNotEmptyString(systemMessage))
+        options.systemMessage = systemMessage
+      options.completionParams = { model, temperature, top_p }
+    }
 
 		if (lastContext != null) {
 			if (apiModel === 'ChatGPTAPI')
@@ -125,11 +119,9 @@ async function chatReplyProcess(options: RequestOptions) {
 	}
 }
 
-async function fetchBalance() {
-	// 计算起始日期和结束日期
-
-	const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-	const OPENAI_API_BASE_URL = process.env.OPENAI_API_BASE_URL
+async function fetchUsage() {
+  const OPENAI_API_KEY = process.env.OPENAI_API_KEY
+  const OPENAI_API_BASE_URL = process.env.OPENAI_API_BASE_URL
 
 	if (!isNotEmptyString(OPENAI_API_KEY))
 		return Promise.resolve('-')
@@ -148,16 +140,23 @@ async function fetchBalance() {
 		'Content-Type': 'application/json',
 	}
 
-	try {
-		// 获取已使用量
-		const useResponse = await fetch(urlUsage, { headers })
-		const usageData = await useResponse.json() as BalanceResponse
-		const usage = Math.round(usageData.total_usage) / 100
-		return Promise.resolve(usage ? `$${usage}` : '-')
-	}
-	catch {
-		return Promise.resolve('-')
-	}
+  const options = {} as SetProxyOptions
+
+  setupProxy(options)
+
+  try {
+    // 获取已使用量
+    const useResponse = await options.fetch(urlUsage, { headers })
+    if (!useResponse.ok)
+      throw new Error('获取使用量失败')
+    const usageData = await useResponse.json() as UsageResponse
+    const usage = Math.round(usageData.total_usage) / 100
+    return Promise.resolve(usage ? `$${usage}` : '-')
+  }
+  catch (error) {
+    global.console.log(error)
+    return Promise.resolve('-')
+  }
 }
 
 function formatDate(): string[] {
@@ -171,41 +170,44 @@ function formatDate(): string[] {
 }
 
 async function chatConfig() {
-	const balance = await fetchBalance()
-	const reverseProxy = process.env.API_REVERSE_PROXY ?? '-'
-	const httpsProxy = (process.env.HTTPS_PROXY || process.env.ALL_PROXY) ?? '-'
-	const socksProxy = (process.env.SOCKS_PROXY_HOST && process.env.SOCKS_PROXY_PORT)
-		? (`${process.env.SOCKS_PROXY_HOST}:${process.env.SOCKS_PROXY_PORT}`)
-		: '-'
-	return sendResponse<ModelConfig>({
-		type: 'Success',
-		data: { apiModel, reverseProxy, timeoutMs, socksProxy, httpsProxy, balance },
-	})
+  const usage = await fetchUsage()
+  const reverseProxy = process.env.API_REVERSE_PROXY ?? '-'
+  const httpsProxy = (process.env.HTTPS_PROXY || process.env.ALL_PROXY) ?? '-'
+  const socksProxy = (process.env.SOCKS_PROXY_HOST && process.env.SOCKS_PROXY_PORT)
+    ? (`${process.env.SOCKS_PROXY_HOST}:${process.env.SOCKS_PROXY_PORT}`)
+    : '-'
+  return sendResponse<ModelConfig>({
+    type: 'Success',
+    data: { apiModel, reverseProxy, timeoutMs, socksProxy, httpsProxy, usage },
+  })
 }
 
-function setupProxy(options: ChatGPTAPIOptions | ChatGPTUnofficialProxyAPIOptions) {
-	if (isNotEmptyString(process.env.SOCKS_PROXY_HOST) && isNotEmptyString(process.env.SOCKS_PROXY_PORT)) {
-		const agent = new SocksProxyAgent({
-			hostname: process.env.SOCKS_PROXY_HOST,
-			port: process.env.SOCKS_PROXY_PORT,
-			userId: isNotEmptyString(process.env.SOCKS_PROXY_USERNAME) ? process.env.SOCKS_PROXY_USERNAME : undefined,
-			password: isNotEmptyString(process.env.SOCKS_PROXY_PASSWORD) ? process.env.SOCKS_PROXY_PASSWORD : undefined,
-		})
-		options.fetch = (url, options) => {
-			return fetch(url, { agent, ...options })
-		}
-	}
-	else {
-		if (isNotEmptyString(process.env.HTTPS_PROXY) || isNotEmptyString(process.env.ALL_PROXY)) {
-			const httpsProxy = process.env.HTTPS_PROXY || process.env.ALL_PROXY
-			if (httpsProxy) {
-				const agent = new HttpsProxyAgent(httpsProxy)
-				options.fetch = (url, options) => {
-					return fetch(url, { agent, ...options })
-				}
-			}
-		}
-	}
+function setupProxy(options: SetProxyOptions) {
+  if (isNotEmptyString(process.env.SOCKS_PROXY_HOST) && isNotEmptyString(process.env.SOCKS_PROXY_PORT)) {
+    const agent = new SocksProxyAgent({
+      hostname: process.env.SOCKS_PROXY_HOST,
+      port: process.env.SOCKS_PROXY_PORT,
+      userId: isNotEmptyString(process.env.SOCKS_PROXY_USERNAME) ? process.env.SOCKS_PROXY_USERNAME : undefined,
+      password: isNotEmptyString(process.env.SOCKS_PROXY_PASSWORD) ? process.env.SOCKS_PROXY_PASSWORD : undefined,
+    })
+    options.fetch = (url, options) => {
+      return fetch(url, { agent, ...options })
+    }
+  }
+  else if (isNotEmptyString(process.env.HTTPS_PROXY) || isNotEmptyString(process.env.ALL_PROXY)) {
+    const httpsProxy = process.env.HTTPS_PROXY || process.env.ALL_PROXY
+    if (httpsProxy) {
+      const agent = new HttpsProxyAgent(httpsProxy)
+      options.fetch = (url, options) => {
+        return fetch(url, { agent, ...options })
+      }
+    }
+  }
+  else {
+    options.fetch = (url, options) => {
+      return fetch(url, { ...options })
+    }
+  }
 }
 
 function currentModel(): ApiModel {
